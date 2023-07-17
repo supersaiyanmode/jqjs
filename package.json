@@ -8,7 +8,7 @@
   "author": "Michael Homer",
   "license": "MIT",
   "private": false,
-  "main": "jqjs.js",  
+  "main": "jq.js",  
   "files": [
     "jq.js"
   ],
