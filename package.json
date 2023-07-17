@@ -10,7 +10,7 @@
   "private": false,
   "main": "jqjs.js",  
   "files": [
-    "jqjs.js"
+    "jq.js"
   ],
   "dependencies": {}
 }
