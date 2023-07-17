@@ -1,0 +1,16 @@
+{
+  "name": "jqjs",
+  "version": "0.0.8",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/supersaiyanmode/jqts.git"
+  },
+  "author": "Michael Homer",
+  "license": "MIT",
+  "private": false,
+  "main": "jq.js",  
+  "files": [
+    "jq.js"
+  ],
+  "dependencies": {}
+}
