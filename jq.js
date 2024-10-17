@@ -22,11 +22,26 @@
 
 function compile(prog) {
     let filter = parse(tokenise(prog).tokens)
-    return input => filter.node.apply(input, {
+    const ret = input => filter.node.apply(input, {
         userFuncs: {},
         userFuncArgs: {},
         variables: {}
     })
+    ret.filter = filter
+    ret.trace = (input) => {
+        let dest = []
+        filter.node.trace(input, {
+            userFuncs: {},
+            userFuncArgs: {},
+            variables: {}
+        }, dest)
+        return {
+            node: null,
+            output: input,
+            next: dest,
+        }
+    }
+    return ret
 }
 
 function compileNode(prog) {
@@ -175,6 +190,7 @@ function makeFunc(params, body, pathFunc=false) {
 function defineShorthandFunction(name, params, body) {
     let fname = name + '/' + params.length
     functions[fname] = makeFunc(params, body)
+    functions[fname].params = Array.prototype.map.call(params, label => ({label, mode: 'defer'}))
     functions[fname + '-paths'] = makeFunc(params, body, true)
 }
 
@@ -774,6 +790,37 @@ function shuntingYard(stream) {
     return stack[0]
 }
 
+function trace_helper(input, conf, dest, rest) {
+    let filter = rest[0]
+    for (let v of filter.apply(input, conf)) {
+        let next = []
+        dest.push({
+            node: filter,
+            output: v,
+            next,
+            variables: JSON.parse(JSON.stringify(conf.variables)),
+        })
+        if (rest.length > 1) {
+            trace_helper(v, conf, next, rest.slice(1))
+        }
+    }
+}
+
+function sourced_trace_helper(input, conf, dest, rest) {
+    let forward = []
+    let src = this
+    while (src.source) {
+        if (src.filter) {
+            forward.unshift(src.filter)
+            src = src.source
+        } else {
+            src = src.source
+        }
+    }
+    forward.unshift(src)
+    trace_helper(input, conf, dest, forward)
+}
+
 // Convert a value to a consistent type name, addressing the issue
 // that arrays are objects.
 function nameType(o) {
@@ -814,14 +861,27 @@ function nameType(o) {
 //   NotEqualsOperator, a != b
 //   AlternativeOperator, a // b
 //   UpdateAssignment, .x.y |= .z
-//   FunctionCall, fname(arg1, arg2)
+//   FunctionCall, fname(arg1; arg2)
 //   FormatNode, @format, @format "a\(...)"
 //   ErrorSuppression, foo?
 //   VariableBinding, ... as $x (not the pipe)
 //   VariableReference, $x
 //   ReduceNode, reduce .[] as $x (0; . + $x)
 //   IfNode, if a then b elif c then d else e end
-class ParseNode {}
+class ParseNode {
+    trace(input, conf, dest) {
+        for (let v of this.apply(input, conf)) {
+            dest.push({
+                node: this,
+                output: v,
+                next: [],
+            })
+        }
+    }
+    toString() {
+        return '<' + this.constructor.name + '>'
+    }
+}
 class FilterNode extends ParseNode {
     constructor(nodes) {
         super()
@@ -849,6 +909,10 @@ class FilterNode extends ParseNode {
             }
         }
     }
+    trace = sourced_trace_helper
+    toString() {
+        return (this.source ? this.source.toString() : '') + (this.filter ? this.filter.toString() : '')
+    }
 }
 class IndexNode extends ParseNode {
     constructor(lhs, index) {
@@ -869,7 +933,6 @@ class IndexNode extends ParseNode {
                 if (typeof i == 'number' && i < 0 && nameType(l) == 'array')
                     yield l[l.length + i]
                 else
-                    yield l[i]
                     yield typeof l[i] == 'undefined' ? null : l[i]
             }
         }
@@ -878,6 +941,9 @@ class IndexNode extends ParseNode {
         for (let l of this.lhs.paths(input, conf))
             for (let a of this.index.apply(input, conf))
                 yield l.concat([a])
+    }
+    toString() {
+        return this.lhs.toString() + '[' + this.index.toString() + ']'
     }
 }
 class SliceNode extends ParseNode {
@@ -902,6 +968,9 @@ class SliceNode extends ParseNode {
             for (let a of this.from.apply(input, conf))
                 for (let b of this.to.apply(input, conf))
                     yield l.concat([{start:a, end:b}])
+    }
+    toString() {
+        return this.lhs.toString() + '[' + this.from.toString() + ':' + this.to.toString() + ']'
     }
 }
 class GenericIndex extends ParseNode {
@@ -933,6 +1002,9 @@ class IdentifierIndex extends GenericIndex {
     constructor(v) {
         super(new StringNode(v))
     }
+    toString() {
+        return '.' + this.index.value
+    }
 }
 class GenericSlice extends ParseNode {
     constructor(fr, to) {
@@ -955,6 +1027,9 @@ class GenericSlice extends ParseNode {
             for (let r of this.to.apply(input, conf))
                 yield [{start: l, end: r}]
     }
+    toString() {
+        return '.[' + this.from.toString() + ':' + this.to.toString() + ']'
+    }
 }
 class IdentityNode extends ParseNode {
     constructor() {
@@ -965,6 +1040,9 @@ class IdentityNode extends ParseNode {
     }
     * paths(input, conf) {
         yield []
+    }
+    toString() {
+        return '.'
     }
 }
 class ValueNode extends ParseNode {
@@ -977,6 +1055,9 @@ class ValueNode extends ParseNode {
     }
     * paths(input, conf) {
         yield this.value
+    }
+    toString() {
+        return JSON.stringify(this.value)
     }
 }
 class StringNode extends ValueNode {
@@ -1003,21 +1084,37 @@ class StringLiteral extends ParseNode {
             }
         }
     }
+    toString() {
+        let s = ''
+        for (let i = 0; i < this.strings.length; i++) {
+            s += this.strings[i].replace('\\', '\\\\').replace('"', '\\"')
+            if (this.interpolations[i])
+                s += '\\(' + this.interpolations[i].toString() + ')'
+        }
+        return '"' + s + '"'
+    }
 }
 class NumberNode extends ValueNode {
     constructor(v) {
         super(v)
+    }
+    toString() {
+        return this.value.toString()
     }
 }
 class BooleanNode extends ValueNode {
     constructor(v) {
         super(v)
     }
+    toString() {
+        return this.value ? 'true' : 'false'
+    }
 }
 class SpecificValueIterator extends ParseNode {
     constructor(source) {
         super()
         this.source = source
+        this.filter = new GenericValueIterator()
     }
     * apply(input, conf) {
         for (let o of this.source.apply(input, conf))
@@ -1046,6 +1143,10 @@ class SpecificValueIterator extends ParseNode {
             v2 = bb.next()
         }
     }
+    toString() {
+        return this.source.toString() + '[]'
+    }
+    trace = sourced_trace_helper
 }
 class GenericValueIterator extends ParseNode {
     constructor() {
@@ -1065,6 +1166,9 @@ class GenericValueIterator extends ParseNode {
             for (let o of Object.keys(input))
                 yield [o]
     }
+    toString() {
+        return '.[]'
+    }
 }
 class CommaNode extends ParseNode {
     constructor(branches) {
@@ -1079,6 +1183,9 @@ class CommaNode extends ParseNode {
         for (let b of this.branches)
             yield* b.paths(input, conf)
     }
+    toString() {
+        return this.branches.join(', ')
+    }
 }
 class ArrayNode extends ParseNode {
     constructor(body) {
@@ -1088,12 +1195,19 @@ class ArrayNode extends ParseNode {
     * apply(input, conf) {
         yield Array.from(this.body.apply(input, conf))
     }
+    toString() {
+        return '[' + this.body + ']'
+    }
 }
 class PipeNode extends ParseNode {
     constructor(lhs, rhs) {
         super()
         this.lhs = lhs
         this.rhs = rhs
+        this.isPipe = true
+    }
+    toString() {
+        return `${this.lhs} | ${this.rhs}`
     }
     * apply(input, conf) {
         for (let v of this.lhs.apply(input, conf))
@@ -1117,6 +1231,22 @@ class PipeNode extends ParseNode {
             yield [v1.value, v2.value]
             v1 = aa.next()
             v2 = bb.next()
+        }
+    }
+    trace(input, conf, dest) {
+        for (let v of this.lhs.apply(input, conf)) {
+            let next = []
+            let more = {}
+            if (this.lhs instanceof VariableBinding)
+                more.variableValue = conf.variables[this.lhs.name]
+            dest.push({
+                node: this.lhs,
+                output: v,
+                next,
+                variables: JSON.parse(JSON.stringify(conf.variables)),
+                ...more
+            })
+            this.rhs.trace(v, conf, next)
         }
     }
 }
@@ -1150,6 +1280,9 @@ class ObjectNode extends ParseNode {
             yield* this.helper(keys, values, startAt + 1, obj)
         }
     }
+    toString() {
+        return '{' + this.fields.map(({key, value}) => key.toString() + ': ' + value.toString()).join(', ') + '}'
+    }
 }
 class RecursiveDescent extends ParseNode {
     constructor() {
@@ -1178,6 +1311,9 @@ class RecursiveDescent extends ParseNode {
             for (let [k,v] of Object.entries(s))
                 yield* this.recursePaths(v, prefix.concat([k]))
     }
+    toString() {
+        return '..'
+    }
 }
 class OperatorNode extends ParseNode {
     constructor(l, r) {
@@ -1189,6 +1325,33 @@ class OperatorNode extends ParseNode {
         for (let rr of this.r.apply(input, conf))
             for (let ll of this.l.apply(input, conf))
                 yield this.combine(ll, rr, nameType(ll), nameType(rr))
+    }
+    trace(input, conf, dest) {
+        for (let v of this.l.apply(input, conf)) {
+            let next = []
+            dest.push({
+                node: this.l,
+                output: v,
+                next,
+                subsidiary: 'left'
+            })
+            for (let v2 of this.r.apply(input, conf)) {
+                let next2 = []
+                next.push({
+                    node: this.r,
+                    output: v2,
+                    next: next2,
+                    subsidiary: 'right',
+                })
+                let result = this.combine(v, v2, nameType(v), nameType(v2))
+                let next3 = []
+                next2.push({
+                    node: this,
+                    output: result,
+                    next: next3,
+                })
+            }
+        }
     }
 }
 class AdditionOperator extends OperatorNode {
@@ -1209,6 +1372,9 @@ class AdditionOperator extends OperatorNode {
         if (lt == 'object' && rt == 'object')
             return Object.assign(Object.assign({}, l), r)
         throw 'type mismatch in +:' + lt + ' and ' + rt + ' cannot be added'
+    }
+    toString() {
+        return this.l + ' + ' + this.r
     }
 }
 class MultiplicationOperator extends OperatorNode {
@@ -1245,6 +1411,9 @@ class MultiplicationOperator extends OperatorNode {
         }
         return l
     }
+    toString() {
+        return this.l + ' * ' + this.r
+    }
 }
 class SubtractionOperator extends OperatorNode {
     constructor(l, r) {
@@ -1259,6 +1428,9 @@ class SubtractionOperator extends OperatorNode {
             return l.filter(x => r.indexOf(x) == -1)
         throw 'type mismatch in -:' + lt + ' and ' + rt + ' cannot be subtracted'
     }
+    toString() {
+        return this.l + ' - ' + this.r
+    }
 }
 class DivisionOperator extends OperatorNode {
     constructor(l, r) {
@@ -1271,6 +1443,9 @@ class DivisionOperator extends OperatorNode {
             return l.split(r)
         throw 'type mismatch in -:' + lt + ' and ' + rt + ' cannot be divided'
     }
+    toString() {
+        return this.l + ' / ' + this.r
+    }
 }
 class ModuloOperator extends OperatorNode {
     constructor(l, r) {
@@ -1281,6 +1456,9 @@ class ModuloOperator extends OperatorNode {
             return l % r
         throw 'type mismatch in -:' + lt + ' and ' + rt + ' cannot be divided (remainder)'
     }
+    toString() {
+        return this.l + ' % ' + this.r
+    }
 }
 class LessThanOperator extends OperatorNode {
     constructor(l, r) {
@@ -1288,6 +1466,9 @@ class LessThanOperator extends OperatorNode {
     }
     combine(l, r, lt, rt) {
         return compareValues(l, r) < 0
+    }
+    toString() {
+        return this.l + ' < ' + this.r
     }
 }
 class GreaterThanOperator extends OperatorNode {
@@ -1297,6 +1478,9 @@ class GreaterThanOperator extends OperatorNode {
     combine(l, r, lt, rt) {
         return compareValues(l, r) > 0
     }
+    toString() {
+        return this.l + ' > ' + this.r
+    }
 }
 class LessEqualsOperator extends OperatorNode {
     constructor(l, r) {
@@ -1305,6 +1489,9 @@ class LessEqualsOperator extends OperatorNode {
     combine(l, r, lt, rt) {
         return compareValues(l, r) <= 0
     }
+    toString() {
+        return this.l + ' <= ' + this.r
+    }
 }
 class GreaterEqualsOperator extends OperatorNode {
     constructor(l, r) {
@@ -1312,6 +1499,9 @@ class GreaterEqualsOperator extends OperatorNode {
     }
     combine(l, r, lt, rt) {
         return compareValues(l, r) >= 0
+    }
+    toString() {
+        return this.l + ' >= ' + this.r
     }
 }
 class EqualsOperator extends OperatorNode {
@@ -1343,6 +1533,9 @@ class EqualsOperator extends OperatorNode {
         }
         return true
     }
+    toString() {
+        return this.l + ' == ' + this.r
+    }
 }
 class NotEqualsOperator extends EqualsOperator {
     constructor(l, r) {
@@ -1350,6 +1543,9 @@ class NotEqualsOperator extends EqualsOperator {
     }
     combine(l, r, lt, rt) {
         return !super.combine(l, r, lt, rt)
+    }
+    toString() {
+        return this.l + ' != ' + this.r
     }
 }
 class AlternativeOperator extends ParseNode {
@@ -1366,6 +1562,9 @@ class AlternativeOperator extends ParseNode {
         }
         if (!found)
             yield* this.rhs.apply(input, conf)
+    }
+    toString() {
+        return this.l + ' // ' + this.r
     }
 }
 class UpdateAssignment extends ParseNode {
@@ -1406,6 +1605,9 @@ class UpdateAssignment extends ParseNode {
             delete o[last]
         return obj
     }
+    toString() {
+        return this.l + ' |= ' + this.r
+    }
 }
 class FunctionCall extends ParseNode {
     constructor(fname, args) {
@@ -1436,6 +1638,54 @@ class FunctionCall extends ParseNode {
             throw 'no paths for ' + this.name
         return func(input, conf, this.args)
     }
+    trace(input, conf, dest) {
+        if (this.args.length == 1 && !conf.userFuncArgs[this.name] && this.ordinary) {
+            let func = functions[this.name];
+            if (func.params && func.params.length > 0) {
+                if (func.params[0].mode == 'defer') {
+                    return super.trace(input, conf, dest)
+                }
+            }
+            for (let a1 of this.args[0].apply(input, conf)) {
+                let next = []
+                let paramLabel = 'arg1'
+                if (func.params && func.params.length > 0 && func.params[0].label)
+                    paramLabel = func.params[0].label;
+                dest.push({
+                    node: this.args[0],
+                    output: a1,
+                    next,
+                    subsidiary: paramLabel
+                })
+                for (let result of func(input, conf, [new ValueYielder(a1)])) {
+                    let next2 = []
+                    next.push({
+                        node: this,
+                        output: result,
+                        next: next2,
+                    })
+                }
+            }    
+        } else {
+            return super.trace(input, conf, dest)
+        }
+    }
+    get ordinary() {
+        let func = functions[this.name];
+        if (!func) return true;
+        if (func.params && func.params.length > 0) {
+            if (func.params[0].mode == 'defer') {
+                return false;
+            }
+        }
+        return true;
+    }
+    toString() {
+        if (this.args.length == 0)
+            return this.name.replace(/\/.*$/, '')
+        else
+            return this.name.replace(/\/.*$/, '') + '(' + this.args.join('; ') + ')'
+    }
 }
 class FormatNode extends ParseNode {
     constructor(fname, quote) {
@@ -1444,9 +1694,15 @@ class FormatNode extends ParseNode {
         this.string = quote
     }
     * apply(input, conf) {
-        if (!this.string)
+        if (typeof this.string === 'undefined')
             return yield formats[this.name](input)
         yield* this.string.applyEscape(input, formats[this.name], conf)
+    }
+    toString() {
+        if (this.string)
+            return '@' + this.name + ' ' + this.string
+        else
+            return '@' + this.name
     }
 }
 class ErrorSuppression extends ParseNode {
@@ -1471,6 +1727,9 @@ class ErrorSuppression extends ParseNode {
         } catch {
         }
     }
+    toString() {
+        return this.inner + '?'
+    }
 }
 class VariableBinding extends ParseNode {
     constructor(lhs, name) {
@@ -1485,6 +1744,9 @@ class VariableBinding extends ParseNode {
         }
         delete conf.variables[this.name]
     }
+    toString() {
+        return this.value + ' as $' + this.name
+    }
 }
 class VariableReference extends ParseNode {
     constructor(name) {
@@ -1493,6 +1755,9 @@ class VariableReference extends ParseNode {
     }
     * apply(input, conf) {
         yield conf.variables[this.name]
+    }
+    toString() {
+        return '$' + this.name
     }
 }
 class ReduceNode extends ParseNode {
@@ -1518,6 +1783,9 @@ class ReduceNode extends ParseNode {
             yield accum
         }
     }
+    toString() {
+        return 'reduce ' + this.generator + ' as $' + this.name + '(' + this.init + '; ' + this.expr + ')'
+    }
 }
 class IfNode extends ParseNode {
     constructor(conditions, thens, elseBranch) {
@@ -1541,6 +1809,28 @@ class IfNode extends ParseNode {
             return
         }
         yield input
+    }
+    toString() {
+        let s = ''
+        for (let [c,t] of zip(this.conditions, this.thens))
+            s += 'if ' + c + ' then ' + t + ' el'
+        if (this.elseBranch) {
+            return s + 'se ' + this.elseBranch + ' end'
+        }
+        return s.slice(0, -2) + 'end'
+    }
+}
+
+class ValueYielder {
+    /* This is used internally for evaluating functions at specific values. */
+    constructor(v) {
+        this.value = v
+    }
+    * apply(input, conf) {
+        yield this.value
+    }
+    toString() {
+        return this.value.toString()
     }
 }
 
@@ -1637,20 +1927,22 @@ const functions = {
     },
     'empty/0': function*(input) {
     },
-    'path/1': function*(input, conf, args) {
+    'path/1': Object.assign(function*(input, conf, args) {
         let f = args[0]
         yield* f.paths(input, conf)
-    },
-    'select/1': function*(input, conf, args) {
+    }, {params: [{mode: 'defer'}]}),
+    'select/1': Object.assign(function*(input, conf, args) {
         let selector = args[0]
         for (let b of selector.apply(input, conf))
-            if (b)
+            if (b !== false && b !== null)
                 yield input
-    },
+    }, {
+        params: [{label: 'predicate', mode: 'eval'}]
+    }),
     'select/1-paths': function*(input, conf, args) {
         let selector = args[0]
         for (let b of selector.apply(input, conf))
-            if (b)
+            if (b !== false && b !== null)
                 yield []
     },
     'length/0': function*(input) {
@@ -1664,27 +1956,27 @@ const functions = {
     'keys/0': function*(input) {
         yield* Object.keys(input).sort()
     },
-    'has/1': function*(input, conf, args) {
+    'has/1': Object.assign(function*(input, conf, args) {
         let f = args[0]
         for (let k of f.apply(input, conf))
             yield input.hasOwnProperty(k)
-    },
+    }, {params: [{label: 'key'}]}),
     'has/1-paths': function*(input, conf, args) {
         let f = args[0]
         for (let k of f.apply(input, conf))
             if (input.hasOwnProperty(k)) yield []
     },
-    'in/1': function*(input, conf, args) {
+    'in/1': Object.assign(function*(input, conf, args) {
         let f = args[0]
         for (let o of f.apply(input, conf))
             yield o.hasOwnProperty(input)
-    },
+    }, {params: [{label: 'object'}]}),
     'in/1-paths': function*(input, conf, args) {
         let f = args[0]
         for (let o of f.apply(input, conf))
             if (o.hasOwnProperty(input)) yield []
     },
-    'contains/1': function*(input, conf, args) {
+    'contains/1': Object.assign(function*(input, conf, args) {
         let f = args[0]
         let t = nameType(input)
         for (let o of f.apply(input, conf)) {
@@ -1694,8 +1986,8 @@ const functions = {
             } else
                 yield containsHelper(input, o)
         }
-    },
-    'inside/1': function*(input, conf, args) {
+    }, {params: [{label: 'element'}]}),
+    'inside/1': Object.assign(function*(input, conf, args) {
         let f = args[0]
         let t = nameType(input)
         for (let o of f.apply(input, conf)) {
@@ -1705,7 +1997,7 @@ const functions = {
             } else
                 yield containsHelper(o, input)
         }
-    },
+    }, {params: [{label: 'container'}]}),
     'to_entries/0': function*(input, conf) {
         let t = nameType(input)
         if (t == 'array') {
@@ -1731,11 +2023,11 @@ const functions = {
     'type/0': function*(input) {
         yield nameType(input)
     },
-    'range/1': function*(input, conf, args) {
+    'range/1': Object.assign(function*(input, conf, args) {
         for (let m of args[0].apply(input, conf))
             for (let i = 0; i < m; i++)
                 yield i
-    },
+    }, {params: [{mode: 'defer'}]}),
     'range/2': function*(input, conf, args) {
         for (let min of args[0].apply(input, conf))
             for (let max of args[1].apply(input, conf))
@@ -1756,14 +2048,14 @@ const functions = {
             if (b) return yield true
         yield false
     },
-    'any/1': function*(input, conf, args) {
+    'any/1': Object.assign(function*(input, conf, args) {
         if (nameType(input) != 'array')
             throw 'any/1 requires array as input, not ' + nameType(input)
         for (let v of input)
             for (let b of args[0].apply(v, conf))
                 if (b) return yield true
         yield false
-    },
+    }, {params: [{mode: 'defer'}]}),
     'any/2': function*(input, conf, args) {
         let gen = args[0]
         let cond = args[1]
@@ -1779,14 +2071,14 @@ const functions = {
             if (!b) return yield false
         yield true
     },
-    'all/1': function*(input, conf, args) {
+    'all/1': Object.assign(function*(input, conf, args) {
         if (nameType(input) != 'array')
             throw 'all/1 requires array as input, not ' + nameType(input)
         for (let v of input)
             for (let b of args[0].apply(v, conf))
                 if (!b) return yield false
         yield true
-    },
+    }, {params: [{mode: 'defer'}]}),
     'all/2': function*(input, conf, args) {
         let gen = args[0]
         let cond = args[1]
@@ -1810,13 +2102,18 @@ const functions = {
     'tonumber/0': function*(input) {
         yield Number.parseFloat(input)
     },
+    'reverse/0': function*(input) {
+        if (nameType(input) != 'array')
+            throw 'can only reverse arrays, not ' + nameType(input)
+        yield input.toReversed()
+    },
     'sort/0': function*(input, conf) {
         if (nameType(input) != 'array')
             throw 'can only sort arrays, not ' + nameType(input)
         let r = Array.from(input)
         yield r.sort(compareValues)
     },
-    'sort_by/1': function*(input, conf, args) {
+    'sort_by/1': Object.assign(function*(input, conf, args) {
         if (nameType(input) != 'array')
             throw 'can only sort arrays, not ' + nameType(input)
         let key = args[0]
@@ -1826,7 +2123,7 @@ const functions = {
         }))
         r.sort((a, b) => compareValues(a.key, b.key))
         yield r.map(a => a.value)
-    },
+    }, {params: [{mode: 'defer'}]}),
     'explode/0': function*(input, conf) {
         if (nameType(input) != 'string')
             throw 'can only explode string, not ' + nameType(input)
@@ -1844,14 +2141,14 @@ const functions = {
             throw 'can only implode array, not ' + nameType(input)
         yield input.map(x => String.fromCodePoint(x)).join('')
     },
-    'split/1': function*(input, conf, args) {
+    'split/1': Object.assign(function*(input, conf, args) {
         if (nameType(input) != 'string')
             throw 'can only split string, not ' + nameType(input)
         for (let s of args[0].apply(input, conf)) {
             yield input.split(s)
         }
-    },
-    'join/1': function*(input, conf, args) {
+    }, {params: [{label: 'separator'}]}),
+    'join/1': Object.assign(function*(input, conf, args) {
         if (nameType(input) != 'array')
             throw 'can only join array, not ' + nameType(input)
         let a = input.map(x => {
@@ -1863,7 +2160,7 @@ const functions = {
         })
         for (let s of args[0].apply(input, conf))
             yield a.join(s)
-    },
+    }, {params: [{label: 'delimiter'}]}),
 }
 
 // Implements the containment algorithm, returning whether haystack
@@ -1920,5 +2217,5 @@ defineShorthandFunction('nulls', '', 'select(type == "null")')
 
 const jq = {compile, prettyPrint}
 // Delete these two lines for a non-module version (CORS-safe)
-export { compile, prettyPrint, compileNode }
+export { compile, prettyPrint, compileNode, formats }
 export default jq
